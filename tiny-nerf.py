@@ -77,6 +77,20 @@ class Result:
             disparity=torch.cat([b.disparity for b in batches], dim=0),
         )
 
+    def save(self, root_dir: str):
+        root_dir = Path(root_dir)
+        root_dir.mkdir(exist_ok=True, parents=True)
+        rgb_result = tensor_to_image(self.rgb)
+        depth_result = tensor_to_image((1 - self.depth / self.depth.max())[..., None].expand(dataset.W, dataset.H, 3))
+        white_bg_result = tensor_to_image(self.rgb + (1 - self.acc[..., None]))
+        disparity_result = tensor_to_image(self.disparity, normalize=True)
+        acc_result = tensor_to_image(self.acc, normalize=True)
+        rgb_result.save(str(root_dir/f'rgb.png'))
+        depth_result.save(str(root_dir/f'depth.png'))
+        white_bg_result.save(str(root_dir/f'white.png'))
+        disparity_result.save(str(root_dir/f'disparity.png'))
+        acc_result.save(str(root_dir/f'acc.png'))
+
 
 class PositionEncoding(nn.Module):
     def __init__(self, L):
@@ -89,7 +103,7 @@ class PositionEncoding(nn.Module):
         embedding = [x]
         for i in range(self.L):
             for func in [torch.sin, torch.cos]:
-                embedding.append(func(2.**i * torch.pi * x))
+                embedding.append(func(2.**i * x))
         return torch.cat(embedding, -1)
 
 
@@ -279,9 +293,10 @@ def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_d
     # the distance between each sample in volume_rendering
     flattened_sampled_points = all_sampled_points.reshape(-1, 3)
     viewing_directions = rays_direction[..., None, :].expand([batch_size, num_samples, 3]).reshape(-1, 3)
+    normalized_viewing_directions = viewing_directions / torch.norm(viewing_directions, dim=-1, keepdim=True)
 
     # run all the points through the fine model
-    opacity, color = model(flattened_sampled_points, viewing_directions, regularize_volume_density=is_training)
+    opacity, color = model(flattened_sampled_points, normalized_viewing_directions, regularize_volume_density=is_training)
 
     # reshape back to the image shape
     opacity = opacity.reshape([batch_size, num_samples])
@@ -533,7 +548,10 @@ plot_every_n_steps = 100
 inf = torch.tensor([1e10], device=device)
 eps = torch.tensor([1e-10], device=device)
 
-def tensor_to_image(tensor):
+def tensor_to_image(tensor, normalize=False):
+    if normalize:
+        tensor = tensor - torch.min(tensor)
+        tensor = tensor / (torch.max(tensor) + eps)
     return Image.fromarray((tensor.detach().cpu().numpy() * 255).astype(np.uint8))
 
 total_steps = 0
@@ -546,16 +564,5 @@ for epoch in range(num_epochs):
         if total_steps % plot_every_n_steps == 0:
             with torch.no_grad():
                 coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.batch_size)
-                root_dir = Path(f'results/{total_steps}')
-                root_dir.mkdir(exist_ok=True, parents=True)
-                rgb_result = tensor_to_image(fine_result.rgb)
-                rgb_result.save(str(root_dir/f'rgb_{total_steps}.png'))
-                depth_result = tensor_to_image((1 - fine_result.depth / fine_result.depth.max())[..., None].expand(dataset.W, dataset.H, 3))
-                depth_result.save(str(root_dir/f'depth_{total_steps}.png'))
-                white_bg_result = tensor_to_image(fine_result.rgb + (1 - fine_result.acc[..., None]))
-                white_bg_result.save(str(root_dir/f'white_{total_steps}.png'))
-                disparity_result = tensor_to_image(fine_result.disparity)
-                disparity_result.save(str(root_dir/f'disparity_{total_steps}.png'))
-                acc_result = tensor_to_image(fine_result.acc)
-                acc_result.save(str(root_dir/f'acc_{total_steps}.png'))
+                fine_result.save(f'results/{total_steps}')
     nerf.lr_scheduler.step()
