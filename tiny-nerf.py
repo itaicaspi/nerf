@@ -13,6 +13,7 @@ from PIL import Image
 from pathlib import Path
 
 from load_blender import load_blender_data
+from replica_dataset import ReplicaDatasetCache
 
 """
 References:
@@ -53,6 +54,8 @@ class Config:
     use_separate_head_for_color: bool = True
     regularize_volume_density: bool = False # if true, adds noise to the base net output during training
     batch_size: int = 4096
+    num_semantic_labels: int = 0
+    semantic_loss_weight: float = 1
 
 
 @dataclass
@@ -61,12 +64,14 @@ class Result:
     depth: torch.Tensor = None
     acc: torch.Tensor = None
     disparity: torch.Tensor = None
+    semantics: torch.Tensor = None
 
     def reshape(self, shape):
         self.rgb = self.rgb.reshape(*shape, 3)
         self.depth = self.depth.reshape(shape)
         self.acc = self.acc.reshape(shape)
         self.disparity = self.disparity.reshape(shape)
+        self.semantics = self.semantics.reshape(*shape, self.semantics.shape[-1]) if self.semantics is not None else None
     
     @staticmethod
     def from_batches(batches):
@@ -75,21 +80,27 @@ class Result:
             depth=torch.cat([b.depth for b in batches], dim=0),
             acc=torch.cat([b.acc for b in batches], dim=0),
             disparity=torch.cat([b.disparity for b in batches], dim=0),
+            semantics=torch.cat([b.semantics for b in batches], dim=0) if batches[0].semantics is not None else None,
         )
 
     def save(self, root_dir: str):
         root_dir = Path(root_dir)
         root_dir.mkdir(exist_ok=True, parents=True)
         rgb_result = tensor_to_image(self.rgb)
-        depth_result = tensor_to_image((1 - self.depth / self.depth.max())[..., None].expand(dataset.W, dataset.H, 3))
+        depth_result = tensor_to_image((1 - self.depth / self.depth.max())[..., None].expand(dataset.H, dataset.W, 3))
         white_bg_result = tensor_to_image(self.rgb + (1 - self.acc[..., None]))
         disparity_result = tensor_to_image(self.disparity, normalize=True)
         acc_result = tensor_to_image(self.acc, normalize=True)
+
         rgb_result.save(str(root_dir/f'rgb.png'))
         depth_result.save(str(root_dir/f'depth.png'))
         white_bg_result.save(str(root_dir/f'white.png'))
         disparity_result.save(str(root_dir/f'disparity.png'))
         acc_result.save(str(root_dir/f'acc.png'))
+
+        if self.semantics is not None:
+            semantics_result = tensor_to_image(self.semantics.argmax(dim=-1), normalize=True)
+            semantics_result.save(str(root_dir/f'semantics.png'))
 
 
 class PositionEncoding(nn.Module):
@@ -108,7 +119,7 @@ class PositionEncoding(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers, skip_connections=None):
+    def __init__(self, input_size, hidden_size, output_size, num_layers, skip_connections=None, output_activation=False):
         super().__init__()
 
         self.skip_connections = skip_connections or []
@@ -123,12 +134,13 @@ class MLP(nn.Module):
         self.layers.append(nn.Linear(hidden_size, output_size))
 
         self.activation = nn.ReLU()
+        self.output_activation = output_activation
 
     def forward(self, input):
         x = input
         for index, layer in enumerate(self.layers):
             x = layer(x)
-            if index < len(self.layers) - 1:
+            if index < len(self.layers) - 1 or self.output_activation:
                 x = self.activation(x)
             if index in self.skip_connections:
                 x = torch.cat([input, x], -1)
@@ -145,10 +157,17 @@ class NERFModel(nn.Module):
         self.mlp_base = MLP(
             input_size=self.position_encoder.output_size, 
             hidden_size=config.base_hidden_size,
-            output_size=config.base_output_size + 1 if config.use_separate_head_for_color else 4,
+            output_size=config.base_output_size if config.use_separate_head_for_color else 4,
             num_layers=config.num_layers_base,
-            skip_connections=config.skip_connections
+            skip_connections=config.skip_connections,
+            output_activation=True
         )
+
+        self.volume_density_linear = nn.Linear(config.base_output_size, 1)
+        self.features_linear = nn.Linear(config.base_output_size, 256)
+        self.semantics_linear = None
+        if config.num_semantic_labels > 0:
+            self.semantics_linear = nn.Linear(config.base_output_size, config.num_semantic_labels)
 
         # take the encoded direction and the 256 dimensional feature vector and output the RGB color
         if config.use_separate_head_for_color:
@@ -172,7 +191,9 @@ class NERFModel(nn.Module):
 
         # pass the encoded position through the base MLP to get the volume density and 256 dimensional feature vector
         x = self.mlp_base(positions)
-        volume_density, features = x[..., 0], x[..., 1:]
+        volume_density = self.volume_density_linear(x)
+        features = self.features_linear(x)
+        semantics_logits = self.semantics_linear(x) if self.semantics_linear is not None else None
 
         # if we are training, add noise to the volume density to encourage regularization and prevent floater artifacts
         # See Appendix A of the paper
@@ -188,10 +209,10 @@ class NERFModel(nn.Module):
         rgb_radiance = self.sigmoid(rgb_radiance)
 
         # return the opacity (volume density) and color (RGB radiance)
-        return volume_density, rgb_radiance
+        return volume_density, rgb_radiance, semantics_logits
 
 
-def get_camera_coords(W, H, focal):
+def get_camera_coords(W: int, H: int, focal: float, axis_signs: torch.Tensor):
     # generate two matrices representing the 2D coordinates at each point on the
     # pixel plane
     u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
@@ -205,7 +226,8 @@ def get_camera_coords(W, H, focal):
     # convert the coordinates from the image plane to the camera plane 
     # 3D coordinates. we set z_c = 1, and use it to calculate x_c and y_c.
     # this is based on the similar triangles rule: x_c / z_c = x_i / f
-    camera_coords = torch.stack([x_i/focal, -y_i/focal, -torch.ones_like(u)], dim=-1)
+    camera_coords = torch.stack([x_i/focal, y_i/focal, torch.ones_like(u)], dim=-1)
+    camera_coords = camera_coords * axis_signs
     return camera_coords
 
 
@@ -296,11 +318,12 @@ def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_d
     normalized_viewing_directions = viewing_directions / torch.norm(viewing_directions, dim=-1, keepdim=True)
 
     # run all the points through the fine model
-    opacity, color = model(flattened_sampled_points, normalized_viewing_directions, regularize_volume_density=is_training)
+    opacity, color, semantics_logits = model(flattened_sampled_points, normalized_viewing_directions, regularize_volume_density=is_training)
 
-    # reshape back to the image shape
+    # # reshape back to the image shape
     opacity = opacity.reshape([batch_size, num_samples])
     color = color.reshape([batch_size, num_samples, 3])
+    semantics_logits = semantics_logits.reshape([batch_size, num_samples, -1]) if semantics_logits is not None else None
 
     # calculate the distances between the sampled points delta_i = t_(i+1) - t_i
     # doing this on the t values is the same as on sampled_points directly, since the ray direction is normalized
@@ -334,6 +357,9 @@ def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_d
     # sum the weighted colors for all the samples
     rgb_map = torch.sum(weights[..., None] * color, dim=-2)
 
+    # calculate the semantic classes map
+    semantics = torch.sum(weights[..., None] * semantics_logits, dim=-2) if semantics_logits is not None else None
+    
     with torch.no_grad():
         # calculate the depth of each pixel by calculating the expected distance
         depth_map = torch.sum(weights * t_vals, dim=-1)
@@ -349,6 +375,7 @@ def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_d
         depth=depth_map,
         acc=acc_map,
         disparity=disparity_map,
+        semantics=semantics
     )
     return weights, result
 
@@ -378,9 +405,87 @@ def render_rays(config: Config, model: nn.Module, rays_center: torch.Tensor, ray
     return coarse_result, fine_result
 
 
+class NERFDataset(Dataset):
+    def __init__(self, dataset, keep_data_on_cpu=False) -> None:
+        self.data = self.load_data(dataset)
+        self.images = torch.tensor(self.data['images'], device=device, requires_grad=False)
+        self.poses = torch.tensor(self.data['poses'], device=device, requires_grad=False)
+        self.focal = torch.tensor(self.data['focal'], device=device, requires_grad=False)
+        self.semantics = None
+        if 'semantics' in self.data:
+            self.semantics = torch.tensor(self.data['semantics'], device=device, requires_grad=False)
+            self.semantics = self.semantics[:-1]
+            self.test_semantics = self.semantics[-1]
+        self.test_pose = self.poses[-1]
+        self.test_image = self.images[-1]
+        self.images = self.images[:-1]
+        self.poses = self.poses[:-1]
+        self.W = self.images.shape[2]
+        self.H = self.images.shape[1]
+        self.empty_tensor = torch.Tensor()
+
+        # axes are defined with different signs for opencv vs opengl. This is dataset dependent
+        # and is emboddied in the camera pose matrices
+        self.axis_signs = torch.tensor(self.data.get('axis_signs', [1, -1, -1]), device=device, requires_grad=False)
+
+        # init inputs and targets for training
+        self.camera_coords = get_camera_coords(self.W, self.H, self.focal, self.axis_signs)
+        all_rays_centers, all_rays_directions = [], []
+        for camera_pose in self.poses:
+            rays_center, rays_direction = get_rays(self.camera_coords, camera_pose)
+            all_rays_centers.append(rays_center.reshape(-1, 3))
+            all_rays_directions.append(rays_direction.reshape(-1, 3))
+        self.all_rays_centers = torch.cat(all_rays_centers)
+        self.all_rays_directions = torch.cat(all_rays_directions)
+        self.all_target_colors = self.images.reshape(-1, 3)
+        self.all_target_semantics = self.semantics.reshape(-1) if self.semantics is not None else None
+
+        # keep the data on the cpu until it's needed so that we don't run out of gpu memory
+        if keep_data_on_cpu:
+            self.images.to('cpu')
+            self.poses.to('cpu')
+            self.camera_coords.to('cpu')
+            if self.semantics is not None:
+                self.semantics.to('cpu')
+
+    def load_data(self, source='tiny_lego'):
+        if source == 'tiny_lego':
+            return np.load('tiny_nerf_data.npz')
+        elif source == 'lego':
+            images, poses, _, hwf, _ = load_blender_data(
+                "../nerf/data/nerf_synthetic/lego", True, 8)
+            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:]) # replace background with white
+            return {
+                "images": images.astype(np.float32),
+                "poses": poses.astype(np.float32),
+                "focal": hwf[-1]
+            }
+        elif source == 'replica':
+            dataset = ReplicaDatasetCache('/root/home/data/semantic_nerf/room_0/Sequence_1', range(550), range(1))#, 240, 320)
+            hfov = 90
+            focal = dataset.train_samples['image'].shape[2] / 2.0 / math.tan(math.radians(hfov / 2.0))
+            return {
+                "images": dataset.train_samples['image'].astype(np.float32),
+                "poses": dataset.train_samples['T_wc'].astype(np.float32),
+                "focal": focal,
+                "semantics": dataset.train_samples['semantic_remap_clean'].astype(np.int64),
+                "axis_signs": [1, 1, 1]
+            }
+
+    def __len__(self):
+        return len(self.all_target_colors)
+
+    def __getitem__(self, index):
+        return {
+            'rays_center': self.all_rays_centers[index].to(device),
+            'rays_direction': self.all_rays_directions[index].to(device),
+            'target_color': self.all_target_colors[index].to(device),
+            'target_semantics': self.all_target_semantics[index].to(device) if self.all_target_semantics is not None else self.empty_tensor
+        }
+
 
 class NERF:
-    def __init__(self, config: Config, W, H, focal, device='cuda'):
+    def __init__(self, config: Config, dataset: NERFDataset, device='cuda'):
         self.config = config
         # create models
         self.coarse_model = NERFModel(config)
@@ -394,11 +499,15 @@ class NERF:
 
         self.optimizer = torch.optim.Adam(parameters, lr=config.learning_rate)
         self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
+
+        self.image_criterion = nn.MSELoss()
+        self.semantics_criterion = nn.CrossEntropyLoss(ignore_index=-1)
         
-        self.W = W
-        self.H = H
-        self.focal = focal
-        self.camera_coords = get_camera_coords(W, H, focal)
+        self.W = dataset.W
+        self.H = dataset.H
+        self.focal = dataset.focal
+        self.axis_signs = dataset.axis_signs
+        self.camera_coords = get_camera_coords(self.W, self.H, self.focal, self.axis_signs)
     
     def render_camera_pose(self, camera_pose, batch_size=1024):
         with torch.no_grad():
@@ -418,8 +527,8 @@ class NERF:
             coarse_result = Result.from_batches(coarse_results)
             fine_result = Result.from_batches(fine_results)
 
-            coarse_result.reshape((self.W, self.H))
-            fine_result.reshape((self.W, self.H))
+            coarse_result.reshape((self.H, self.W))
+            fine_result.reshape((self.H, self.W))
 
         return coarse_result, fine_result
 
@@ -429,13 +538,20 @@ class NERF:
 
         return coarse_result, fine_result
 
-    def step(self, rays_center, rays_direction, target):
+    def step(self, rays_center, rays_direction, target_image, target_semantics=None):
         coarse_result, fine_result = self.render_rays(rays_center, rays_direction, rand=True)
-        loss = torch.mean((coarse_result.rgb - target)**2)
 
+        # calculate the image loss
+        loss = self.image_criterion(coarse_result.rgb, target_image)
         if self.config.num_fine_samples > 0:
-            fine_loss = torch.mean((fine_result.rgb - target)**2)
-            loss += fine_loss
+            loss += self.image_criterion(fine_result.rgb, target_image)
+
+        # calculate the semantics loss
+        if self.config.num_semantic_labels > 0:
+            semantic_loss = self.semantics_criterion(coarse_result.semantics, target_semantics - 1)
+            if self.config.num_fine_samples > 0:
+                semantic_loss += self.semantics_criterion(fine_result.semantics, target_semantics - 1)
+            loss += (self.config.semantic_loss_weight * semantic_loss)
 
         # train coarse model
         self.optimizer.zero_grad()
@@ -443,6 +559,27 @@ class NERF:
         self.optimizer.step()
 
         return loss
+
+
+semantics_config = Config(
+    num_layers_base = 8,
+    num_layers_head = 1,
+    skip_connections = [4],
+    base_hidden_size = 256,
+    base_output_size = 256,
+    head_hidden_size = 128,
+    near = .1,
+    far = 10,
+    num_coarse_samples = 64,
+    num_fine_samples=128,
+    L_position = 10,
+    L_direction = 4,
+    learning_rate = 5e-4,
+    regularize_volume_density = True,
+    batch_size = 1024,
+    num_semantic_labels = 27,
+    semantic_loss_weight = 1
+)
 
 
 original_config = Config(
@@ -478,69 +615,12 @@ tiny_config = Config(
 )
 
 
+# load data and setup models
 device = 'cuda'
-
-
-class NERFDataset(Dataset):
-    def __init__(self, keep_data_on_cpu=False) -> None:
-        self.data = self.load_data('lego')
-        self.images = torch.tensor(self.data['images'], device=device, requires_grad=False)
-        self.poses = torch.tensor(self.data['poses'], device=device, requires_grad=False)
-        self.focal = torch.tensor(self.data['focal'], device=device, requires_grad=False)
-        self.test_pose = self.poses[-1]
-        self.images = self.images[:-1]
-        self.poses = self.poses[:-1]
-        self.W = self.images.shape[1]
-        self.H = self.images.shape[2]
-
-        # init inputs and targets for training
-        self.camera_coords = get_camera_coords(self.W, self.H, self.focal)
-        all_rays_centers, all_rays_directions = [], []
-        for camera_pose in self.poses:
-            rays_center, rays_direction = get_rays(self.camera_coords, camera_pose)
-            all_rays_centers.append(rays_center.reshape(-1, 3))
-            all_rays_directions.append(rays_direction.reshape(-1, 3))
-        self.all_rays_centers = torch.cat(all_rays_centers)
-        self.all_rays_directions = torch.cat(all_rays_directions)
-        self.all_target_colors = self.images.reshape(-1, 3)
-
-        # keep the data on the cpu until it's needed so that we don't run out of gpu memory
-        if keep_data_on_cpu:
-            self.images.to('cpu')
-            self.poses.to('cpu')
-            self.camera_coords.to('cpu')
-
-    def load_data(self, source='tiny_lego'):
-        if source == 'tiny_lego':
-            return np.load('tiny_nerf_data.npz')
-        elif source == 'lego':
-            images, poses, render_poses, hwf, i_split = load_blender_data(
-                "../nerf/data/nerf_synthetic/lego", True, 8)
-            i_train, i_val, i_test = i_split
-            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
-            return {
-                "images": images,
-                "poses": poses,
-                "focal": hwf[-1]
-            }
-
-    def __len__(self):
-        return len(self.all_target_colors)
-
-    def __getitem__(self, index):
-        return {
-            'rays_center': self.all_rays_centers[index].to(device),
-            'rays_direction': self.all_rays_directions[index].to(device),
-            'target_color': self.all_target_colors[index].to(device)
-        }
-
-config = original_config
-
-# load data
-dataset = NERFDataset()
+config = semantics_config
+dataset = NERFDataset('replica')
 dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
-
-nerf = NERF(config, dataset.W, dataset.H, dataset.focal, device=device)
+nerf = NERF(config, dataset, device=device)
 
 # training parameters
 num_epochs = 100
@@ -554,10 +634,14 @@ def tensor_to_image(tensor, normalize=False):
         tensor = tensor / (torch.max(tensor) + eps)
     return Image.fromarray((tensor.detach().cpu().numpy() * 255).astype(np.uint8))
 
+tensor_to_image(dataset.test_image).save(f'results/test_image.png')
+if config.num_semantic_labels > 0:
+    tensor_to_image(dataset.test_semantics, normalize=True).save(f'results/test_semantics.png')
+
 total_steps = 0
 for epoch in range(num_epochs):
     for iter, batch in enumerate(dataloader):
-        loss = nerf.step(batch['rays_center'], batch['rays_direction'], batch['target_color'])
+        loss = nerf.step(batch['rays_center'], batch['rays_direction'], batch['target_color'], batch['target_semantics'])
         print(f'epoch {epoch+1} / step {total_steps+1}: loss = {loss.item()}')
         total_steps += 1
 
