@@ -11,6 +11,7 @@ from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from pathlib import Path
+from datetime import datetime
 
 from load_blender import load_blender_data
 from replica_dataset import ReplicaDatasetCache
@@ -425,7 +426,7 @@ class NERFDataset(Dataset):
         self.empty_tensor = torch.Tensor()
 
         # axes are defined with different signs for opencv vs opengl. This is dataset dependent
-        # and is emboddied in the camera pose matrices
+        # and is emboddied in the camera pose matrices. opencv is [1, 1, 1] and opengl is [1, -1, -1]
         self.axis_signs = torch.tensor(self.data.get('axis_signs', [1, -1, -1]), device=device, requires_grad=False)
 
         # init inputs and targets for training
@@ -469,6 +470,27 @@ class NERFDataset(Dataset):
                 "poses": dataset.train_samples['T_wc'].astype(np.float32),
                 "focal": focal,
                 "semantics": dataset.train_samples['semantic_remap_clean'].astype(np.int64),
+                "axis_signs": [1, 1, 1]
+            }
+        elif source == 'custom':
+            root_dir = Path('/root/code/nerfstudio/data/itai5')
+            with open(str(root_dir/"transforms.json")) as f:
+                transforms = json.load(f)
+            scale_down = 4
+            focal = ((transforms['fl_x'] + transforms['fl_y']) / 2) / (scale_down ** 2)  # TODO: support different focal lengths for non ponhole cameras
+            frames = transforms['frames']
+            images = []
+            poses = []
+            for frame in frames:
+                file_path = root_dir / frame['file_path'].replace('images/', f'images_{scale_down}/' if scale_down > 1 else 'images/')
+                image = Image.open(str(file_path))
+                images.append(np.array(image) / 255)
+                pose = np.array(frame['transform_matrix'])
+                poses.append(pose)
+            return {
+                "images": np.array(images).astype(np.float32),
+                "poses": np.array(poses).astype(np.float32),
+                "focal": focal,
                 "axis_signs": [1, 1, 1]
             }
 
@@ -617,8 +639,8 @@ tiny_config = Config(
 
 # load data and setup models
 device = 'cuda'
-config = semantics_config
-dataset = NERFDataset('replica')
+config = original_config
+dataset = NERFDataset('custom')
 dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 nerf = NERF(config, dataset, device=device)
 
@@ -634,19 +656,25 @@ def tensor_to_image(tensor, normalize=False):
         tensor = tensor / (torch.max(tensor) + eps)
     return Image.fromarray((tensor.detach().cpu().numpy() * 255).astype(np.uint8))
 
-tensor_to_image(dataset.test_image).save(f'results/test_image.png')
-if config.num_semantic_labels > 0:
-    tensor_to_image(dataset.test_semantics, normalize=True).save(f'results/test_semantics.png')
+results_dir = "results/itai"
+Path(results_dir).mkdir(exist_ok=True, parents=True)
 
+# save reference target images
+tensor_to_image(dataset.test_image).save(f'{results_dir}/test_image.png')
+if config.num_semantic_labels > 0:
+    tensor_to_image(dataset.test_semantics, normalize=True).save(f'{results_dir}/test_semantics.png')
+
+# train
 total_steps = 0
 for epoch in range(num_epochs):
     for iter, batch in enumerate(dataloader):
         loss = nerf.step(batch['rays_center'], batch['rays_direction'], batch['target_color'], batch['target_semantics'])
-        print(f'epoch {epoch+1} / step {total_steps+1}: loss = {loss.item()}')
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f'{timestamp} epoch {epoch+1} / step {total_steps+1}: loss = {loss.item()}')
         total_steps += 1
 
         if total_steps % plot_every_n_steps == 0:
             with torch.no_grad():
                 coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.batch_size)
-                fine_result.save(f'results/{total_steps}')
+                fine_result.save(f'{results_dir}/{total_steps}')
     nerf.lr_scheduler.step()
