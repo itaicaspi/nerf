@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import itertools
+import json
 import math
+import os
 from symbol import parameters
 from typing import List
 import numpy as np
@@ -9,6 +11,8 @@ from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from pathlib import Path
+
+from load_blender import load_blender_data
 
 """
 References:
@@ -53,14 +57,25 @@ class Config:
 
 @dataclass
 class Result:
-    rgb: torch.Tensor
-    depth: torch.Tensor
-    acc: torch.Tensor
+    rgb: torch.Tensor = None
+    depth: torch.Tensor = None
+    acc: torch.Tensor = None
+    disparity: torch.Tensor = None
 
     def reshape(self, shape):
         self.rgb = self.rgb.reshape(*shape, 3)
         self.depth = self.depth.reshape(shape)
         self.acc = self.acc.reshape(shape)
+        self.disparity = self.disparity.reshape(shape)
+    
+    @staticmethod
+    def from_batches(batches):
+        return Result(
+            rgb=torch.cat([b.rgb for b in batches], dim=0),
+            depth=torch.cat([b.depth for b in batches], dim=0),
+            acc=torch.cat([b.acc for b in batches], dim=0),
+            disparity=torch.cat([b.disparity for b in batches], dim=0),
+        )
 
 
 class PositionEncoding(nn.Module):
@@ -201,23 +216,26 @@ def get_coarse_t_vals(batch_size, near, far, num_samples, is_training=False):
     # in the paper this is represented by:
     # t_i ~ U[t_n + (i-1)/N * (t_f - t_n), t_n + i/N * (t_f - t_n)]
     if is_training:
-        bin_size = (far - near) / num_samples
-        t_vals = t_vals + torch.rand_like(t_vals) * bin_size
+        mid_t_vals = 0.5 * (t_vals[..., 1:] + t_vals[..., :-1])
+        bin_starts = torch.cat([t_vals[..., :1], mid_t_vals], dim=-1)
+        bin_ends = torch.cat([mid_t_vals, t_vals[..., -1:]], dim=-1)
+        t_vals = bin_starts + torch.rand_like(t_vals) * (bin_ends - bin_starts)
 
     return t_vals
 
 
-def get_fine_t_vals(batch_size, weights, bin_mid_points, num_samples):
+def get_fine_t_vals(batch_size, weights, t_vals, num_samples):
     with torch.no_grad():
         # convert weights to probabilities (pdf)
-        weights = weights + 1e-5 # prevent division by zero
+        weights = weights[..., 1:-1] + 1e-5 # prevent division by zero
         pdf = weights / weights.sum(dim=-1, keepdim=True)
 
         # get cdf from the pdf
         cdf = torch.cumsum(pdf, dim=-1)
-        cdf = torch.roll(cdf, 1, -1)
-        cdf[..., 0] = 0
+        cdf = torch.cat((torch.zeros_like(cdf[..., 0, None]), cdf), dim=-1)
 
+        t_mids = 0.5 * (t_vals[..., 1:] + t_vals[..., :-1])
+        
         # inverse transform sampling. see https://en.wikipedia.org/wiki/Inverse_transform_sampling
         # get the largest x for which cdf(x) <= u
         # start by the generating uniform random numbers in the range [0, 1]
@@ -226,19 +244,21 @@ def get_fine_t_vals(batch_size, weights, bin_mid_points, num_samples):
         # for each sampled value, find the value in the cdf that is closest to u. this amounts to finding x for which cdf(x) ~= u
         # note that we don't actually find x, but the index of x in the cdf
         indices = torch.searchsorted(cdf, u, right=True)
-        indices = torch.clamp(indices, 1, cdf.shape[-1] - 1)
+        start_indices = torch.clamp(indices - 1, 0, cdf.shape[-1] - 1)
+        end_indices = torch.clamp(indices, 0, cdf.shape[-1] - 1)
 
         # get start and end points of the interval in which the sampled value lies
-        bin_starts = torch.gather(bin_mid_points, -1, indices - 1)
-        bin_ends = torch.gather(bin_mid_points, -1, indices)
+        bin_starts = torch.gather(t_mids, -1, start_indices)
+        bin_ends = torch.gather(t_mids, -1, end_indices)
 
         # get start and end cumulative probabilities of the interval in which the sampled value lies
-        cdf_start = torch.gather(cdf, -1, indices - 1)
-        cdf_end = torch.gather(cdf, -1, indices)
+        cdf_start = torch.gather(cdf, -1, start_indices)
+        cdf_end = torch.gather(cdf, -1, end_indices)
 
         # get the position of each sampled value in the interval normalized to 0-1
         delta_probabilities = cdf_end - cdf_start
-        delta_probabilities = torch.clamp(delta_probabilities, 1e-5, 1.0) # prevent division by zero
+        # delta_probabilities = torch.clamp(delta_probabilities, 1e-5, 1.0) # prevent division by zero
+        delta_probabilities = torch.where(delta_probabilities < 1e-5, torch.ones_like(delta_probabilities), delta_probabilities) # this seems like a mistake but I am not sure about it.
         relative_probabilities = (u - cdf_start) / delta_probabilities
 
         # get the fine t vals
@@ -251,7 +271,18 @@ def convert_t_vals_to_sampled_points(t_vals, rays_center, rays_direction):
     sampled_points = rays_center[..., None, :] + t_vals[..., :, None] * rays_direction[..., None, :]
     return sampled_points
 
-def volume_rendering(batch_size, opacity, color, num_samples, t_vals, rays_direction):
+def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_direction, is_training=False):
+
+    all_sampled_points = convert_t_vals_to_sampled_points(t_vals, rays_center, rays_direction)
+
+    # concat the fine sampled points to the coarse sampled points and sort them so that we can later calculate
+    # the distance between each sample in volume_rendering
+    flattened_sampled_points = all_sampled_points.reshape(-1, 3)
+    viewing_directions = rays_direction[..., None, :].expand([batch_size, num_samples, 3]).reshape(-1, 3)
+
+    # run all the points through the fine model
+    opacity, color = model(flattened_sampled_points, viewing_directions, regularize_volume_density=is_training)
+
     # reshape back to the image shape
     opacity = opacity.reshape([batch_size, num_samples])
     color = color.reshape([batch_size, num_samples, 3])
@@ -259,7 +290,6 @@ def volume_rendering(batch_size, opacity, color, num_samples, t_vals, rays_direc
     # calculate the distances between the sampled points delta_i = t_(i+1) - t_i
     # doing this on the t values is the same as on sampled_points directly, since the ray direction is normalized
     # to a unit vector
-    inf = torch.tensor([1e10], device=device)
     delta_ts = torch.cat([t_vals[..., 1:] - t_vals[..., :-1], inf.expand(t_vals[..., :1].shape)], dim=-1)
 
     # Multiply the distance between the sampled points by the norm of the rays direction
@@ -276,7 +306,7 @@ def volume_rendering(batch_size, opacity, color, num_samples, t_vals, rays_direc
     # T_i = exp(-sum_{j=1}^{i-1} (sigma_j * delta_j)) = prod_{j=1}^{i-1} [ exp(-sigma_j * delta_j) ]
     # since a_i = 1 - exp(-sigma_i * delta_i), we can simplify this to:
     # T_i = prod_{j=1}^{i-1} [ 1 - a_j ]
-    T_is = torch.cumprod(1 - alphas + 1e-10, dim=-1)
+    T_is = torch.cumprod(1 - alphas + eps, dim=-1)
 
     # we push a 1 to the beginning of the transmittance list to make sure
     # the ray makes it at least to the first step (TODO: better understand this)
@@ -296,65 +326,37 @@ def volume_rendering(batch_size, opacity, color, num_samples, t_vals, rays_direc
         # calculate the sum of the weights along each ray
         acc_map = torch.sum(weights, dim=-1)
 
-    return weights, rgb_map, depth_map, acc_map
+        # calculate the disparity map
+        disparity_map = 1 / torch.maximum(eps, depth_map / torch.maximum(eps, acc_map))
+
+    result = Result(
+        rgb=rgb_map,
+        depth=depth_map,
+        acc=acc_map,
+        disparity=disparity_map,
+    )
+    return weights, result
 
 
 def render_rays(config: Config, model: nn.Module, rays_center: torch.Tensor, rays_direction: torch.Tensor, is_training: bool=False, fine_model: nn.Module = None):
-    near = config.near
-    far = config.far
     num_coarse_samples = config.num_coarse_samples
     num_fine_samples = config.num_fine_samples
     batch_size = rays_center.shape[0]  # don't take it from the config, since it might be different when testing
 
-    t_vals = get_coarse_t_vals(batch_size, near, far, num_coarse_samples, is_training)
-    sampled_points = convert_t_vals_to_sampled_points(t_vals, rays_center, rays_direction)
+    coarse_t_vals = get_coarse_t_vals(batch_size, config.near, config.far, num_coarse_samples, is_training)
 
-    # reshape to a batch by converting to shape (W x H x N_samples, 3)
-    flattened_sampled_points = sampled_points.reshape(-1, 3)
-    viewing_directions = rays_direction[..., None, :].expand([batch_size, num_coarse_samples, 3]).reshape(-1, 3)
-
-    # run the model to get the volume density and RGB radiance
-    opacity, color = model(flattened_sampled_points, viewing_directions, regularize_volume_density=is_training)
-
-    weights, coarse_rgb_map, coarse_depth_map, coarse_acc_map = volume_rendering(batch_size, opacity, color, num_coarse_samples, t_vals, rays_direction)
-
-    coarse_result = Result(
-        rgb=coarse_rgb_map,
-        depth=coarse_depth_map,
-        acc=coarse_acc_map
-    )
+    weights, coarse_result = volume_rendering(model, batch_size, num_coarse_samples, coarse_t_vals, rays_center, rays_direction, is_training=is_training)
 
     if config.num_fine_samples > 0:
-        fine_model = fine_model or model
-
-        # get bin mid points for the fine sampling
-        mid_t_vals = 0.5 * (t_vals[..., 1:] + t_vals[..., :-1])
-
         # get the t values for the fine sampling by sampling from the distribution defined 
         # by the coarse sampling done above
-        fine_t_vals = get_fine_t_vals(batch_size, weights[..., 1:-1], mid_t_vals, num_fine_samples)
+        fine_t_vals = get_fine_t_vals(batch_size, weights, coarse_t_vals, num_fine_samples)
 
         # concatenate the coarse and fine t values and convert them to sampled points
         # we need to sort them to make sure we can calculate the bin widths later in volume_rendering
-        all_t_vals = torch.cat([t_vals, fine_t_vals], dim=-1)
-        all_t_vals = torch.sort(all_t_vals, dim=-1).values
-        all_sampled_points = convert_t_vals_to_sampled_points(all_t_vals, rays_center, rays_direction)
+        all_t_vals = torch.sort(torch.cat([coarse_t_vals, fine_t_vals], dim=-1)).values
 
-        # concat the fine sampled points to the coarse sampled points and sort them so that we can later calculate
-        # the distance between each sample in volume_rendering
-        flattened_sampled_points = all_sampled_points.reshape(-1, 3)
-        viewing_directions = rays_direction[..., None, :].expand([batch_size, num_coarse_samples + num_fine_samples, 3]).reshape(-1, 3)
-
-        # run all the points through the fine model
-        fine_opacity, fine_color = fine_model(flattened_sampled_points, viewing_directions, regularize_volume_density=is_training)
-
-        weights, fine_rgb_map, fine_depth_map, fine_acc_map = volume_rendering(batch_size, fine_opacity, fine_color, num_coarse_samples + num_fine_samples, all_t_vals, rays_direction)
-        
-        fine_result = Result(
-            rgb=fine_rgb_map,
-            depth=fine_depth_map,
-            acc=fine_acc_map
-        )
+        _, fine_result = volume_rendering(fine_model or model, batch_size, num_coarse_samples + num_fine_samples, all_t_vals, rays_center, rays_direction, is_training=is_training)
     else:
         fine_result = None
 
@@ -383,23 +385,32 @@ class NERF:
         self.focal = focal
         self.camera_coords = get_camera_coords(W, H, focal)
     
-    def render(self, camera_pose, rand=False):
-        # generate the rays
-        rays_center, rays_direction = get_rays(self.camera_coords, camera_pose)
-        rays_center = rays_center.reshape(-1, 3)
-        rays_direction = rays_direction.reshape(-1, 3)
+    def render_camera_pose(self, camera_pose, batch_size=1024):
+        with torch.no_grad():
+            # generate the rays
+            rays_center, rays_direction = get_rays(self.camera_coords, camera_pose)
+            rays_center = rays_center.reshape(-1, 3)
+            rays_direction = rays_direction.reshape(-1, 3)
 
-        # render the rays
-        coarse_result, fine_result = self.render_rays(rays_center, rays_direction, rand=rand)
+            # render the rays
+            coarse_results, fine_results = [], []
+            for i in range(0, rays_center.shape[0], batch_size):
+                start = i
+                end = min(i + batch_size, rays_center.shape[0])
+                coarse_result, fine_result = self.render_rays(rays_center[start:end], rays_direction[start:end], rand=False)
+                coarse_results.append(coarse_result)
+                fine_results.append(fine_result)
+            coarse_result = Result.from_batches(coarse_results)
+            fine_result = Result.from_batches(fine_results)
 
-        coarse_result.reshape((self.W, self.H))
-        fine_result.reshape((self.W, self.H))
+            coarse_result.reshape((self.W, self.H))
+            fine_result.reshape((self.W, self.H))
 
         return coarse_result, fine_result
 
     def render_rays(self, rays_center, rays_direction, rand=False):
         # render the rays
-        coarse_result, fine_result = render_rays(self.config, self.coarse_model, rays_center, rays_direction, is_training=rand)
+        coarse_result, fine_result = render_rays(self.config, self.coarse_model, rays_center, rays_direction, is_training=rand, fine_model=self.fine_model)
 
         return coarse_result, fine_result
 
@@ -434,7 +445,7 @@ original_config = Config(
     L_direction = 4,
     learning_rate = 5e-4,
     regularize_volume_density = True,
-    batch_size = 4096
+    batch_size = 1024
 )
 
 tiny_config = Config(
@@ -457,13 +468,13 @@ device = 'cuda'
 
 class NERFDataset(Dataset):
     def __init__(self, keep_data_on_cpu=False) -> None:
-        self.data = np.load('tiny_nerf_data.npz')
+        self.data = self.load_data('lego')
         self.images = torch.tensor(self.data['images'], device=device, requires_grad=False)
         self.poses = torch.tensor(self.data['poses'], device=device, requires_grad=False)
         self.focal = torch.tensor(self.data['focal'], device=device, requires_grad=False)
-        self.test_pose = self.poses[101]
-        self.images = self.images[:100]
-        self.poses = self.poses[:100]
+        self.test_pose = self.poses[-1]
+        self.images = self.images[:-1]
+        self.poses = self.poses[:-1]
         self.W = self.images.shape[1]
         self.H = self.images.shape[2]
 
@@ -483,6 +494,20 @@ class NERFDataset(Dataset):
             self.images.to('cpu')
             self.poses.to('cpu')
             self.camera_coords.to('cpu')
+
+    def load_data(self, source='tiny_lego'):
+        if source == 'tiny_lego':
+            return np.load('tiny_nerf_data.npz')
+        elif source == 'lego':
+            images, poses, render_poses, hwf, i_split = load_blender_data(
+                "../nerf/data/nerf_synthetic/lego", True, 8)
+            i_train, i_val, i_test = i_split
+            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
+            return {
+                "images": images,
+                "poses": poses,
+                "focal": hwf[-1]
+            }
 
     def __len__(self):
         return len(self.all_target_colors)
@@ -505,6 +530,8 @@ nerf = NERF(config, dataset.W, dataset.H, dataset.focal, device=device)
 # training parameters
 num_epochs = 100
 plot_every_n_steps = 100
+inf = torch.tensor([1e10], device=device)
+eps = torch.tensor([1e-10], device=device)
 
 def tensor_to_image(tensor):
     return Image.fromarray((tensor.detach().cpu().numpy() * 255).astype(np.uint8))
@@ -513,17 +540,22 @@ total_steps = 0
 for epoch in range(num_epochs):
     for iter, batch in enumerate(dataloader):
         loss = nerf.step(batch['rays_center'], batch['rays_direction'], batch['target_color'])
-        print(f'epoch {epoch} / step {total_steps}: loss = {loss.item()}')
+        print(f'epoch {epoch+1} / step {total_steps+1}: loss = {loss.item()}')
         total_steps += 1
 
         if total_steps % plot_every_n_steps == 0:
             with torch.no_grad():
-                coarse_result, fine_result = nerf.render(dataset.test_pose)
-                Path('results').mkdir(exist_ok=True)
+                coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.batch_size)
+                root_dir = Path(f'results/{total_steps}')
+                root_dir.mkdir(exist_ok=True, parents=True)
                 rgb_result = tensor_to_image(fine_result.rgb)
-                rgb_result.save(f'results/nerf_{total_steps}.png')
-                depth_result = tensor_to_image((fine_result.depth / fine_result.depth.max())[..., None].expand(dataset.W, dataset.H, 3))
-                depth_result.save(f'results/nerf_depth_{total_steps}.png')
+                rgb_result.save(str(root_dir/f'rgb_{total_steps}.png'))
+                depth_result = tensor_to_image((1 - fine_result.depth / fine_result.depth.max())[..., None].expand(dataset.W, dataset.H, 3))
+                depth_result.save(str(root_dir/f'depth_{total_steps}.png'))
                 white_bg_result = tensor_to_image(fine_result.rgb + (1 - fine_result.acc[..., None]))
-                white_bg_result.save(f'results/nerf_white_{total_steps}.png')
+                white_bg_result.save(str(root_dir/f'white_{total_steps}.png'))
+                disparity_result = tensor_to_image(fine_result.disparity)
+                disparity_result.save(str(root_dir/f'disparity_{total_steps}.png'))
+                acc_result = tensor_to_image(fine_result.acc)
+                acc_result.save(str(root_dir/f'acc_{total_steps}.png'))
     nerf.lr_scheduler.step()
