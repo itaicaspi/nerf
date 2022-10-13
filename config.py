@@ -18,7 +18,7 @@ class Config:
     base_output_size: int = None
     head_hidden_size: int = None
     use_separate_head_for_color: bool = True
-    regularize_volume_density: bool = False # if true, adds noise to the base net output during training
+    volume_density_regularization: float = 0 # if true, adds noise to the base net output during training
     batch_size: int = 4096
     num_semantic_labels: int = 0
     semantic_loss_weight: float = 1

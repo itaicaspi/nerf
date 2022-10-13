@@ -87,7 +87,7 @@ class NERFModel(nn.Module):
 
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
-        self.regularize_volume_density = config.regularize_volume_density
+        self.volume_density_regularization = config.volume_density_regularization
 
     def forward(self, positions, directions, is_training=False):
         # encode the 3D position using a positional encoding
@@ -104,8 +104,8 @@ class NERFModel(nn.Module):
 
         # if we are training, add noise to the volume density to encourage regularization and prevent floater artifacts
         # See Appendix A of the paper
-        if is_training and self.regularize_volume_density:
-            volume_density = volume_density + torch.randn_like(volume_density)
+        if is_training and self.volume_density_regularization > 0:
+            volume_density = volume_density + torch.randn_like(volume_density) * self.volume_density_regularization
         volume_density = self.relu(volume_density)
 
         if self.mlp_head is not None:

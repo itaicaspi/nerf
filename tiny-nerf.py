@@ -149,7 +149,7 @@ semantics_config = Config(
     L_position = 10,
     L_direction = 4,
     learning_rate = 5e-4,
-    regularize_volume_density = True,
+    volume_density_regularization = 0.1,
     batch_size = 1024,
     num_semantic_labels = 27,
     semantic_loss_weight = 1
@@ -170,7 +170,7 @@ original_config = Config(
     L_position = 10,
     L_direction = 4,
     learning_rate = 5e-4,
-    regularize_volume_density = True,
+    volume_density_regularization = 1,
     batch_size = 1024
 )
 
