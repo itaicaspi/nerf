@@ -6,7 +6,7 @@ from datetime import datetime
 from config import Config
 from dataset import NERFDataset
 
-from nerf_core import get_camera_coords, get_rays, mse_to_psnr, render_rays
+from nerf_core import get_camera_coords, get_coarse_t_vals, get_fine_t_vals, get_rays, mse_to_psnr, volume_rendering
 from networks import NERFModel
 from result import Result, tensor_to_image
 
@@ -71,7 +71,7 @@ class NERF:
             for i in range(0, rays_center.shape[0], batch_size):
                 start = i
                 end = min(i + batch_size, rays_center.shape[0])
-                coarse_result, fine_result = self.render_rays(rays_center[start:end], rays_direction[start:end], rand=False)
+                coarse_result, fine_result = self.render_rays(rays_center[start:end], rays_direction[start:end], is_training=False)
                 coarse_results.append(coarse_result)
                 fine_results.append(fine_result)
             coarse_result = Result.from_batches(coarse_results)
@@ -82,14 +82,32 @@ class NERF:
 
         return coarse_result, fine_result
 
-    def render_rays(self, rays_center, rays_direction, rand=False):
-        # render the rays
-        coarse_result, fine_result = render_rays(self.config, self.coarse_model, rays_center, rays_direction, is_training=rand, fine_model=self.fine_model)
+    def render_rays(self, rays_center: torch.Tensor, rays_direction: torch.Tensor, is_training: bool=False):
+        num_coarse_samples = self.config.num_coarse_samples
+        num_fine_samples = self.config.num_fine_samples
+        batch_size = rays_center.shape[0]  # don't take it from the config, since it might be different when testing
+
+        coarse_t_vals = get_coarse_t_vals(batch_size, config.near, config.far, num_coarse_samples, is_training)
+        weights, coarse_result = volume_rendering(self.coarse_model, batch_size, coarse_t_vals, rays_center, rays_direction, is_training=is_training)
+
+        if config.num_fine_samples > 0:
+            # get the t values for the fine sampling by sampling from the distribution defined 
+            # by the coarse sampling done above
+            fine_t_vals = get_fine_t_vals(batch_size, weights, coarse_t_vals, num_fine_samples)
+            fine_t_vals = fine_t_vals.detach() # stop gradients
+
+            # concatenate the coarse and fine t values and convert them to sampled points
+            # we need to sort them to make sure we can calculate the bin widths later in volume_rendering
+            all_t_vals = torch.sort(torch.cat([coarse_t_vals, fine_t_vals], dim=-1)).values
+
+            _, fine_result = volume_rendering(self.fine_model, batch_size, all_t_vals, rays_center, rays_direction, is_training=is_training)
+        else:
+            fine_result = coarse_result
 
         return coarse_result, fine_result
 
     def step(self, rays_center, rays_direction, target_image, target_semantics=None):
-        coarse_result, fine_result = self.render_rays(rays_center, rays_direction, rand=True)
+        coarse_result, fine_result = self.render_rays(rays_center, rays_direction, is_training=True)
 
         # calculate the image loss
         coarse_rgb = coarse_result.white_rgb if self.white_background else coarse_result.rgb
@@ -192,7 +210,7 @@ tiny_config = Config(
 # load data and setup models
 device = 'cuda'
 config = original_config
-results_dir = "results/lego"
+results_dir = "results/lego_qr"
 dataset = NERFDataset('lego')
 dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 nerf = NERF(config, dataset, device=device)

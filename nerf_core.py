@@ -110,7 +110,8 @@ def convert_t_vals_to_sampled_points(t_vals, rays_center, rays_direction):
     sampled_points = rays_center[..., None, :] + t_vals[..., :, None] * rays_direction[..., None, :]
     return sampled_points
 
-def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_direction, is_training=False):
+def volume_rendering(model, batch_size, t_vals, rays_center, rays_direction, is_training=False):
+    num_samples = t_vals.shape[-1]
 
     all_sampled_points = convert_t_vals_to_sampled_points(t_vals, rays_center, rays_direction)
 
@@ -186,31 +187,6 @@ def volume_rendering(model, batch_size, num_samples, t_vals, rays_center, rays_d
     )
     return weights, result
 
-
-def render_rays(config: Config, model: nn.Module, rays_center: torch.Tensor, rays_direction: torch.Tensor, is_training: bool=False, fine_model: nn.Module = None):
-    num_coarse_samples = config.num_coarse_samples
-    num_fine_samples = config.num_fine_samples
-    batch_size = rays_center.shape[0]  # don't take it from the config, since it might be different when testing
-
-    coarse_t_vals = get_coarse_t_vals(batch_size, config.near, config.far, num_coarse_samples, is_training)
-
-    weights, coarse_result = volume_rendering(model, batch_size, num_coarse_samples, coarse_t_vals, rays_center, rays_direction, is_training=is_training)
-
-    if config.num_fine_samples > 0:
-        # get the t values for the fine sampling by sampling from the distribution defined 
-        # by the coarse sampling done above
-        fine_t_vals = get_fine_t_vals(batch_size, weights, coarse_t_vals, num_fine_samples)
-        fine_t_vals = fine_t_vals.detach() # stop gradients
-
-        # concatenate the coarse and fine t values and convert them to sampled points
-        # we need to sort them to make sure we can calculate the bin widths later in volume_rendering
-        all_t_vals = torch.sort(torch.cat([coarse_t_vals, fine_t_vals], dim=-1)).values
-
-        _, fine_result = volume_rendering(fine_model or model, batch_size, num_coarse_samples + num_fine_samples, all_t_vals, rays_center, rays_direction, is_training=is_training)
-    else:
-        fine_result = coarse_result
-
-    return coarse_result, fine_result
 
 
 
