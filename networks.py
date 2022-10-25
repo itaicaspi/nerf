@@ -70,7 +70,7 @@ class NERFModel(nn.Module):
         )
 
         self.volume_density_linear = nn.Linear(config.base_output_size, 1)
-        self.features_linear = nn.Linear(config.base_output_size, 256)
+        self.features_linear = nn.Linear(config.base_output_size, config.base_output_size)
         self.semantics_linear = None
         if config.num_semantic_labels > 0:
             self.semantics_linear = nn.Linear(config.base_output_size, config.num_semantic_labels)

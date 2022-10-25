@@ -153,6 +153,26 @@ class NERF:
         print(f'Loaded checkpoint {checkpoint_path}')
 
 
+instant_ngp_config = Config(
+    num_layers_base = 1,
+    num_layers_head = 2,
+    skip_connections = [],
+    base_hidden_size = 64,
+    base_output_size = 64,
+    head_hidden_size = 64,
+    near = 2,
+    far = 6,
+    num_coarse_samples = 64,
+    num_fine_samples = 128,
+    L_position = 10,
+    L_direction = 4,
+    learning_rate = 5e-4,
+    volume_density_regularization = 1,
+    batch_size = 1024,
+    inference_batch_size=4096
+)
+
+
 semantics_config = Config(
     num_layers_base = 8,
     num_layers_head = 1,
@@ -189,7 +209,8 @@ original_config = Config(
     L_direction = 4,
     learning_rate = 5e-4,
     volume_density_regularization = 1,
-    batch_size = 1024
+    batch_size = 1024,
+    inference_batch_size=4096
 )
 
 tiny_config = Config(
@@ -209,8 +230,8 @@ tiny_config = Config(
 
 # load data and setup models
 device = 'cuda'
-config = original_config
-results_dir = "results/lego_qr"
+config = instant_ngp_config
+results_dir = "results/lego_instant_ngp"
 dataset = NERFDataset('lego')
 dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 nerf = NERF(config, dataset, device=device)
@@ -242,7 +263,7 @@ for epoch in range(1, num_epochs+1):
         
         if total_steps % plot_every_n_steps == 0:
             with torch.no_grad():
-                coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.batch_size)
+                coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.inference_batch_size)
                 fine_result.save(f'{results_dir}/{total_steps}')
         
         if total_steps % step_lr_every_n_steps == 0:

@@ -20,5 +20,6 @@ class Config:
     use_separate_head_for_color: bool = True
     volume_density_regularization: float = 0 # if true, adds noise to the base net output during training
     batch_size: int = 4096
+    inference_batch_size: int = 4096 * 4
     num_semantic_labels: int = 0
     semantic_loss_weight: float = 1
