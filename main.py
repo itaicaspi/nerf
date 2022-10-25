@@ -6,6 +6,7 @@ from config import Config
 from dataset import NERFDataset
 from nerf import NERF
 from result import tensor_to_image
+from remote_plot import plt
 
 
 instant_ngp_config = Config(
@@ -93,7 +94,7 @@ nerf = NERF(config, dataset, device=device)
 
 # training parameters
 num_epochs = 100
-plot_every_n_steps = 500
+plot_every_n_steps = 100
 step_lr_every_n_steps = 1000
 save_checkpoint_every_n_steps = 10000
 
@@ -120,6 +121,7 @@ for epoch in range(1, num_epochs+1):
             with torch.no_grad():
                 coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.inference_batch_size)
                 fine_result.save(f'{results_dir}/{total_steps}')
+                plt.imshow(tensor_to_image(fine_result.white_rgb))
         
         if total_steps % step_lr_every_n_steps == 0:
             nerf.lr_scheduler.step()
