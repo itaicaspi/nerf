@@ -53,7 +53,7 @@ class MLP(nn.Module):
         return x
 
 
-class NERFModel(nn.Module):
+class NERFNetwork(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.position_encoder = PositionEncoding(config.L_position)

@@ -188,7 +188,5 @@ def volume_rendering(model, batch_size, t_vals, rays_center, rays_direction, is_
     return weights, result
 
 
-
-
 def mse_to_psnr(loss): 
     return -10.*torch.log(loss)/np.log(10.)

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from load_blender import load_blender_data
-from nerf_core import get_camera_coords, get_rays
+from rendering_core import get_camera_coords, get_rays
 from replica_dataset import ReplicaDatasetCache
 
 

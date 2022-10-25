@@ -1,14 +1,3 @@
-import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader
-from pathlib import Path
-from datetime import datetime
-from config import Config
-from dataset import NERFDataset
-
-from nerf_core import get_camera_coords, get_coarse_t_vals, get_fine_t_vals, get_rays, mse_to_psnr, volume_rendering
-from networks import NERFModel
-from result import Result, tensor_to_image
 
 """
 References:
@@ -32,21 +21,30 @@ https://github.com/bmild/nerf/blob/18b8aebda6700ed659cb27a0c348b737a5f6ab60/run_
 """
 
 
+import torch
+from torch import nn, optim
+from config import Config
+from dataset import NERFDataset
+from networks import NERFNetwork
+from rendering_core import get_camera_coords, get_coarse_t_vals, get_fine_t_vals, get_rays, mse_to_psnr, volume_rendering
+from result import Result
+
+
 class NERF:
     def __init__(self, config: Config, dataset: NERFDataset, device='cuda'):
         self.config = config
         # create models
-        self.coarse_model = NERFModel(config)
+        self.coarse_model = NERFNetwork(config)
         self.coarse_model.to(device)
         parameters = list(self.coarse_model.parameters())
 
         self.fine_model = None
         if config.num_fine_samples > 0:
-            self.fine_model = NERFModel(config)
+            self.fine_model = NERFNetwork(config)
             self.fine_model.to(device)
             parameters += list(self.fine_model.parameters())
 
-        self.optimizer = torch.optim.Adam(parameters, lr=config.learning_rate)
+        self.optimizer = optim.Adam(parameters, lr=config.learning_rate)
         self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
 
         self.image_criterion = nn.MSELoss()
@@ -87,10 +85,10 @@ class NERF:
         num_fine_samples = self.config.num_fine_samples
         batch_size = rays_center.shape[0]  # don't take it from the config, since it might be different when testing
 
-        coarse_t_vals = get_coarse_t_vals(batch_size, config.near, config.far, num_coarse_samples, is_training)
+        coarse_t_vals = get_coarse_t_vals(batch_size, self.config.near, self.config.far, num_coarse_samples, is_training)
         weights, coarse_result = volume_rendering(self.coarse_model, batch_size, coarse_t_vals, rays_center, rays_direction, is_training=is_training)
 
-        if config.num_fine_samples > 0:
+        if self.config.num_fine_samples > 0:
             # get the t values for the fine sampling by sampling from the distribution defined 
             # by the coarse sampling done above
             fine_t_vals = get_fine_t_vals(batch_size, weights, coarse_t_vals, num_fine_samples)
@@ -138,9 +136,9 @@ class NERF:
         torch.save({
             'epoch': epoch,
             'step': total_steps,
-            'coarse_model_state_dict': nerf.coarse_model.state_dict(),
-            'fine_model_state_dict': nerf.fine_model.state_dict(),
-            'optimizer_state_dict': nerf.optimizer.state_dict(),
+            'coarse_model_state_dict': self.coarse_model.state_dict(),
+            'fine_model_state_dict': self.fine_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
             'loss': loss,
         }, f'{results_dir}/checkpoint_{total_steps}.pt')
         print(f'Saved checkpoint {total_steps}.pt to {results_dir}')
@@ -151,123 +149,3 @@ class NERF:
         self.fine_model.load_state_dict(checkpoint['fine_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f'Loaded checkpoint {checkpoint_path}')
-
-
-instant_ngp_config = Config(
-    num_layers_base = 1,
-    num_layers_head = 2,
-    skip_connections = [],
-    base_hidden_size = 64,
-    base_output_size = 64,
-    head_hidden_size = 64,
-    near = 2,
-    far = 6,
-    num_coarse_samples = 64,
-    num_fine_samples = 128,
-    L_position = 10,
-    L_direction = 4,
-    learning_rate = 5e-4,
-    volume_density_regularization = 1,
-    batch_size = 1024,
-    inference_batch_size=4096
-)
-
-
-semantics_config = Config(
-    num_layers_base = 8,
-    num_layers_head = 1,
-    skip_connections = [4],
-    base_hidden_size = 256,
-    base_output_size = 256,
-    head_hidden_size = 128,
-    near = .1,
-    far = 10,
-    num_coarse_samples = 64,
-    num_fine_samples=128,
-    L_position = 10,
-    L_direction = 4,
-    learning_rate = 5e-4,
-    volume_density_regularization = 0.1,
-    batch_size = 1024,
-    num_semantic_labels = 27,
-    semantic_loss_weight = 1
-)
-
-
-original_config = Config(
-    num_layers_base = 8,
-    num_layers_head = 1,
-    skip_connections = [4],
-    base_hidden_size = 256,
-    base_output_size = 256,
-    head_hidden_size = 128,
-    near = 2,
-    far = 6,
-    num_coarse_samples = 64,
-    num_fine_samples = 128,
-    L_position = 10,
-    L_direction = 4,
-    learning_rate = 5e-4,
-    volume_density_regularization = 1,
-    batch_size = 1024,
-    inference_batch_size=4096
-)
-
-tiny_config = Config(
-    num_layers_base = 8,
-    skip_connections = [4],
-    use_separate_head_for_color = False,
-    base_hidden_size = 256,
-    near = 2,
-    far = 6,
-    num_coarse_samples = 64,
-    L_position = 6,
-    L_direction = 4,
-    learning_rate = 5e-4,
-    batch_size = 4096
-)
-
-
-# load data and setup models
-device = 'cuda'
-config = instant_ngp_config
-results_dir = "results/lego_instant_ngp"
-dataset = NERFDataset('lego')
-dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
-nerf = NERF(config, dataset, device=device)
-
-# training parameters
-num_epochs = 100
-plot_every_n_steps = 500
-step_lr_every_n_steps = 1000
-save_checkpoint_every_n_steps = 10000
-
-
-
-# save reference target images
-Path(results_dir).mkdir(exist_ok=True, parents=True)
-tensor_to_image(dataset.test_image).save(f'{results_dir}/test_image.png')
-if config.num_semantic_labels > 0:
-    tensor_to_image(dataset.test_semantics, shift=True, scale=True).save(f'{results_dir}/test_semantics.png')
-
-# train
-total_steps = 0
-for epoch in range(1, num_epochs+1):
-    for iter, batch in enumerate(dataloader):
-        loss, psnr = nerf.step(batch['rays_center'], batch['rays_direction'], batch['target_color'], batch['target_semantics'])
-
-        total_steps += 1
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        lr = nerf.lr_scheduler.get_last_lr()[0]
-        print(f'{timestamp} epoch {epoch} / step {total_steps}: lr = {lr:.5f} loss = {loss:.5f} psnr = {psnr:.5f}')
-        
-        if total_steps % plot_every_n_steps == 0:
-            with torch.no_grad():
-                coarse_result, fine_result = nerf.render_camera_pose(dataset.test_pose, batch_size=config.inference_batch_size)
-                fine_result.save(f'{results_dir}/{total_steps}')
-        
-        if total_steps % step_lr_every_n_steps == 0:
-            nerf.lr_scheduler.step()
-
-        if total_steps % save_checkpoint_every_n_steps == 0:
-            nerf.save(results_dir, epoch, total_steps, loss)
