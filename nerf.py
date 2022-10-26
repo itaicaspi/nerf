@@ -25,7 +25,6 @@ import torch
 from torch import nn, optim
 from config import Config
 from dataset import NERFDataset
-from networks import NERFNetwork
 from rendering_core import get_camera_coords, get_coarse_t_vals, get_fine_t_vals, get_rays, mse_to_psnr, volume_rendering
 from result import Result
 
@@ -34,18 +33,18 @@ class NERF:
     def __init__(self, config: Config, dataset: NERFDataset, device='cuda'):
         self.config = config
         # create models
-        self.coarse_model = NERFNetwork(config)
+        self.coarse_model = config.network_class(config)
         self.coarse_model.to(device)
         parameters = list(self.coarse_model.parameters())
 
         self.fine_model = None
         if config.num_fine_samples > 0:
-            self.fine_model = NERFNetwork(config)
+            self.fine_model = config.network_class(config)
             self.fine_model.to(device)
             parameters += list(self.fine_model.parameters())
 
         self.optimizer = optim.Adam(parameters, lr=config.learning_rate)
-        self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
+        self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=config.learning_rate_decay)
 
         self.image_criterion = nn.MSELoss()
         self.semantics_criterion = nn.CrossEntropyLoss(ignore_index=-1)

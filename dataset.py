@@ -46,9 +46,9 @@ class NERFDataset(Dataset):
             rays_center, rays_direction = get_rays(self.camera_coords, camera_pose)
             all_rays_centers.append(rays_center.reshape(-1, 3))
             all_rays_directions.append(rays_direction.reshape(-1, 3))
-        self.all_rays_centers = torch.cat(all_rays_centers)
-        self.all_rays_directions = torch.cat(all_rays_directions)
-        self.all_target_colors = self.images.reshape(-1, 3)
+        self.all_rays_centers = torch.cat(all_rays_centers).to('cpu')
+        self.all_rays_directions = torch.cat(all_rays_directions).to('cpu')
+        self.all_target_colors = self.images.reshape(-1, 3).to('cpu')
         self.all_target_semantics = self.semantics.reshape(-1) if self.semantics is not None else None
 
         # keep the data on the cpu until it's needed so that we don't run out of gpu memory
@@ -110,8 +110,8 @@ class NERFDataset(Dataset):
 
     def __getitem__(self, index):
         return {
-            'rays_center': self.all_rays_centers[index].to(self.device),
-            'rays_direction': self.all_rays_directions[index].to(self.device),
-            'target_color': self.all_target_colors[index].to(self.device),
-            'target_semantics': self.all_target_semantics[index].to(self.device) if self.all_target_semantics is not None else self.empty_tensor
+            'rays_center': self.all_rays_centers[index],
+            'rays_direction': self.all_rays_directions[index],
+            'target_color': self.all_target_colors[index],
+            'target_semantics': self.all_target_semantics[index] if self.all_target_semantics is not None else self.empty_tensor
         }

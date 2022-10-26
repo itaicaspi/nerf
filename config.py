@@ -1,14 +1,17 @@
 from dataclasses import dataclass
 from typing import List
+from torch import nn
 
 
 @dataclass
 class Config:
+    network_class: nn.Module
     near: float = 2  # t_n
     far: float = 6  # t_f
     num_coarse_samples: int = 64  # N_c
     num_fine_samples: int = 0  # N_f
     learning_rate: float = 1e-4
+    learning_rate_decay: float = 0.99
     L_position: int = 10
     L_direction: int = None
     num_layers_base: int = 8
