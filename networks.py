@@ -25,7 +25,9 @@ class TruncatedExp(Function):  # pylint: disable=abstract-method
     @custom_bwd
     def backward(ctx, g):  # pylint: disable=arguments-differ
         x = ctx.saved_tensors[0]
-        return g * torch.exp(x.clamp(-15, 15))
+        g = g * torch.exp(x.clamp(-15, 15))
+        g = torch.where(g.isnan(), torch.zeros_like(g), g)
+        return g
 
 
 class PositionEncoding(nn.Module):

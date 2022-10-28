@@ -140,6 +140,7 @@ def volume_rendering(model, batch_size, t_vals, rays_center, rays_direction, is_
 
     # calculate the density of each sample along the ray. Higher values imply higher likelihood of being absorbed
     # at this point
+    opacity = opacity.clamp(-inf, inf) # this is needed to prevent opacity = inf which results in alphas = nan
     alphas = 1 - torch.exp(-opacity * delta_ts)
 
     # In the paper (equation 3) they calculate T_i (the accumulated transmittance along the ray) as:
