@@ -55,6 +55,7 @@ class NERF:
         self.axis_signs = dataset.axis_signs
         self.white_background = dataset.white_background
         self.camera_coords = get_camera_coords(self.W, self.H, self.focal, self.axis_signs)
+        self.camera_poses = dataset.poses
     
     def render_camera_pose(self, camera_pose, batch_size=1024):
         with torch.no_grad():
@@ -103,7 +104,11 @@ class NERF:
 
         return coarse_result, fine_result
 
-    def step(self, rays_center, rays_direction, target_image, target_semantics=None):
+    def step(self, batch):
+        camera_indices, camera_coords, target_image, target_semantics = \
+            batch['camera_indices'], batch['camera_coords'], batch['target_color'], batch['target_semantics']
+        camera_poses = self.camera_poses[camera_indices.squeeze()]
+        rays_center, rays_direction = get_rays(camera_coords, camera_poses)
         coarse_result, fine_result = self.render_rays(rays_center, rays_direction, is_training=True)
 
         # calculate the image loss

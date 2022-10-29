@@ -116,7 +116,7 @@ total_steps = 0
 for epoch in range(1, num_epochs+1):
     for iter, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
-        loss, psnr = nerf.step(batch['rays_center'], batch['rays_direction'], batch['target_color'], batch['target_semantics'])
+        loss, psnr = nerf.step(batch)
 
         total_steps += 1
         timestamp = datetime.now() - start_time

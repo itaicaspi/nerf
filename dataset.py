@@ -41,13 +41,8 @@ class NERFDataset(Dataset):
 
         # init inputs and targets for training
         self.camera_coords = get_camera_coords(self.W, self.H, self.focal, self.axis_signs)
-        all_rays_centers, all_rays_directions = [], []
-        for camera_pose in self.poses:
-            rays_center, rays_direction = get_rays(self.camera_coords, camera_pose)
-            all_rays_centers.append(rays_center.reshape(-1, 3))
-            all_rays_directions.append(rays_direction.reshape(-1, 3))
-        self.all_rays_centers = torch.cat(all_rays_centers).to('cpu')
-        self.all_rays_directions = torch.cat(all_rays_directions).to('cpu')
+        self.all_camera_indices = torch.arange(len(self.poses), device=device, requires_grad=False).repeat_interleave(self.W*self.H)[..., None].to('cpu')
+        self.all_camera_coords = self.camera_coords.reshape(-1, 3).repeat(len(self.poses), 1).to('cpu')
         self.all_target_colors = self.images.reshape(-1, 3).to('cpu')
         self.all_target_semantics = self.semantics.reshape(-1) if self.semantics is not None else None
 
@@ -110,8 +105,8 @@ class NERFDataset(Dataset):
 
     def __getitem__(self, index):
         return {
-            'rays_center': self.all_rays_centers[index],
-            'rays_direction': self.all_rays_directions[index],
+            'camera_indices': self.all_camera_indices[index],
+            'camera_coords': self.all_camera_coords[index],
             'target_color': self.all_target_colors[index],
             'target_semantics': self.all_target_semantics[index] if self.all_target_semantics is not None else self.empty_tensor
         }

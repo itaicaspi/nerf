@@ -43,8 +43,8 @@ def get_rays(camera_coords, camera_pose):
     # | R00 R01 R02 | | X_c |
     # | R10 R11 R12 | | Y_c |
     # | R20 R21 R22 | | Z_c |
-    rays_direction = (camera_pose[:3, :3] @ camera_coords[..., None]).squeeze()
-    rays_center = camera_pose[:3, -1].expand(rays_direction.shape)  # this is the camera center located in the world frame
+    rays_direction = (camera_pose[..., :3, :3] @ camera_coords[..., None]).squeeze()
+    rays_center = camera_pose[..., :3, -1].expand(rays_direction.shape)  # this is the camera center located in the world frame
     return rays_center, rays_direction
 
 
