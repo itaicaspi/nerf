@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+import numpy as np
 
 import tinycudann as tcnn
 from config import Config
@@ -161,17 +162,24 @@ class NERFTinyCudaNetwork(nn.Module):
             },
         )
 
+        # hash grid params
+        num_levels = 16  # L - number of levels
+        encoding_size = 2  # F - feature dimension per entry (encoding size)
+        coarse_resolution = 16  # N_min - the coarsest resolution
+        fine_resolution = 2**19  # N_max - the finest resolution
+        growth_factor = np.exp2((np.log2(fine_resolution) - np.log2(coarse_resolution)) / (num_levels - 1))  # b - per level scale
+
         # the base network with built in positional encoding
         self.mlp_base = tcnn.NetworkWithInputEncoding(
             n_input_dims=3,
             n_output_dims=1 + config.base_output_size,
             encoding_config={
                 "otype": "HashGrid",
-                "n_levels": 16,
-                "n_features_per_level": 2,
-                "log2_hashmap_size": 19,
-                "base_resolution": 16,
-                "per_level_scale": 1.4472692012786865,
+                "n_levels": num_levels,
+                "n_features_per_level": encoding_size,
+                "log2_hashmap_size": np.log2(fine_resolution),
+                "base_resolution": coarse_resolution,
+                "per_level_scale": growth_factor,
             },
             network_config={
                 "otype": "FullyFusedMLP",
