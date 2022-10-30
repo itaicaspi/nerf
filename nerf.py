@@ -25,17 +25,27 @@ import torch
 from torch import nn, optim
 from config import Config
 from dataset import NERFDataset
-from rendering_core import get_camera_coords, get_coarse_t_vals, get_fine_t_vals, get_rays, mse_to_psnr, volume_rendering
+from rendering_core import exp_map_SO3xR3, get_camera_coords, get_coarse_t_vals, get_fine_t_vals, get_rays, mse_to_psnr, multiply_pose_matrices, volume_rendering
 from result import Result
+import camera
+
+from remote_plot import plt
 
 
 class NERF:
     def __init__(self, config: Config, dataset: NERFDataset, device='cuda'):
         self.config = config
+        self.W = dataset.W
+        self.H = dataset.H
+        self.focal = dataset.focal
+        self.axis_signs = dataset.axis_signs
+        self.white_background = dataset.white_background
+
         # create models
+        parameters = []
         self.coarse_model = config.network_class(config)
         self.coarse_model.to(device)
-        parameters = list(self.coarse_model.parameters())
+        parameters += list(self.coarse_model.parameters())
 
         self.fine_model = None
         if config.num_fine_samples > 0:
@@ -43,19 +53,35 @@ class NERF:
             self.fine_model.to(device)
             parameters += list(self.fine_model.parameters())
 
-        self.optimizer = optim.Adam(parameters, lr=config.learning_rate)
-        self.lr_scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=config.learning_rate_decay)
+        self.optimizers = [optim.Adam(parameters, lr=config.learning_rate)]
+        self.lr_schedulers = [optim.lr_scheduler.ExponentialLR(self.optimizers[-1], gamma=config.learning_rate_decay)]
+
+        # camera params
+        self.camera_coords = get_camera_coords(self.W, self.H, self.focal, self.axis_signs)
+        self.ground_truth_poses = dataset.poses
+        self.camera_poses = dataset.poses
+
+        if config.train_camera_poses:
+            # self.camera_poses = camera.lie.se3_to_SE3(torch.zeros((len(self.camera_poses), 6,), device=device))  # initialize camera poses to identity
+            self.camera_pose_transforms = torch.nn.Parameter(torch.normal(0, 0.1, (len(self.camera_poses), 6,), device=device))
+            self.optimizers.append(optim.Adam([self.camera_pose_transforms], lr=config.pose_learning_rate))
+            self.lr_schedulers.append(optim.lr_scheduler.ExponentialLR(self.optimizers[-1], gamma=config.learning_rate_decay))
 
         self.image_criterion = nn.MSELoss()
         self.semantics_criterion = nn.CrossEntropyLoss(ignore_index=-1)
-        
-        self.W = dataset.W
-        self.H = dataset.H
-        self.focal = dataset.focal
-        self.axis_signs = dataset.axis_signs
-        self.white_background = dataset.white_background
-        self.camera_coords = get_camera_coords(self.W, self.H, self.focal, self.axis_signs)
-        self.camera_poses = dataset.poses
+        # self.i = 0       
+
+    def get_camera_poses(self, indices):
+        camera_poses = self.camera_poses[indices]
+        if self.config.train_camera_poses:
+            camera_poses = multiply_pose_matrices(camera.lie.se3_to_SE3(self.camera_pose_transforms[indices]), camera_poses)
+            # if self.i % 90 == 0:
+            #     camera_poses_cpu = camera_poses.detach().cpu().numpy()
+            #     plt.scatter3D(camera_poses_cpu[:, 0, 3], camera_poses_cpu[:, 1, 3], camera_poses_cpu[:, 2, 3])
+            #     ground_truth_cpu = self.ground_truth_poses.detach().cpu().numpy()
+            #     plt.scatter3D(ground_truth_cpu[:, 0, 3], ground_truth_cpu[:, 1, 3], ground_truth_cpu[:, 2, 3], marker="^", c='r', clear_figure=False)
+            # self.i+=1
+        return camera_poses
     
     def render_camera_pose(self, camera_pose, batch_size=1024):
         with torch.no_grad():
@@ -107,7 +133,7 @@ class NERF:
     def step(self, batch):
         camera_indices, camera_coords, target_image, target_semantics = \
             batch['camera_indices'], batch['camera_coords'], batch['target_color'], batch['target_semantics']
-        camera_poses = self.camera_poses[camera_indices.squeeze()]
+        camera_poses = self.get_camera_poses(camera_indices.squeeze())
         rays_center, rays_direction = get_rays(camera_coords, camera_poses)
         coarse_result, fine_result = self.render_rays(rays_center, rays_direction, is_training=True)
 
@@ -130,9 +156,9 @@ class NERF:
             loss += (self.config.semantic_loss_weight * semantic_loss)
 
         # train coarse model
-        self.optimizer.zero_grad()
+        for optimizer in self.optimizers: optimizer.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        for optimizer in self.optimizers: optimizer.step()
 
         return loss.item(), psnr.item()
 
@@ -142,7 +168,7 @@ class NERF:
             'step': total_steps,
             'coarse_model_state_dict': self.coarse_model.state_dict(),
             'fine_model_state_dict': self.fine_model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_state_dicts': [o.state_dict() for o in self.optimizers],
             'loss': loss,
         }, f'{results_dir}/checkpoint_{total_steps}.pt')
         print(f'Saved checkpoint {total_steps}.pt to {results_dir}')
@@ -151,5 +177,6 @@ class NERF:
         checkpoint = torch.load(checkpoint_path)
         self.coarse_model.load_state_dict(checkpoint['coarse_model_state_dict'])
         self.fine_model.load_state_dict(checkpoint['fine_model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        for optimizer, state_dict in zip(self.optimizers, checkpoint['optimizer_state_dicts']):
+            optimizer.load_state_dict(state_dict)
         print(f'Loaded checkpoint {checkpoint_path}')

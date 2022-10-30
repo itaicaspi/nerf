@@ -1,5 +1,7 @@
 
 
+from turtle import position
+from regex import E
 import torch
 from torch import nn
 import numpy as np
@@ -83,7 +85,10 @@ class NERFNetwork(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.position_encoder = PositionEncoding(config.L_position)
+        self.position_encoder_schedule = PositionalEncodingWeightSchedule(config.L_position, 2*3, config.position_encoding_coarse_to_fine_schedule)
+
         self.direction_encoder = PositionEncoding(config.L_direction)
+        self.direction_encoder_schedule = PositionalEncodingWeightSchedule(config.L_direction, 2*3, config.position_encoding_coarse_to_fine_schedule)
 
         # take the encoded position and output the volume density and 256 dimensional feature vector
         self.mlp_base = MLP(
@@ -114,13 +119,18 @@ class NERFNetwork(nn.Module):
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
         self.volume_density_regularization = config.volume_density_regularization
+        self.config = config
 
     def forward(self, positions, directions, is_training=False):
         # encode the 3D position using a positional encoding
         positions = self.position_encoder(positions)
+        if self.config.position_encoding_coarse_to_fine_schedule:
+            positions = self.position_encoder_schedule(positions, is_training=is_training)
 
         # encode the 3D viweing direction vector using a positional encoding
         directions = self.direction_encoder(directions)
+        if self.config.position_encoding_coarse_to_fine_schedule:
+            directions = self.direction_encoder_schedule(directions, is_training=is_training)
 
         # pass the encoded position through the base MLP to get the volume density and 256 dimensional feature vector
         x = self.mlp_base(positions)
@@ -153,14 +163,7 @@ class NERFTinyCudaNetwork(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
 
-        # directional encoder
-        self.direction_encoder = tcnn.Encoding(
-            n_input_dims=3,
-            encoding_config={
-                "otype": "SphericalHarmonics",
-                "degree": 4,
-            },
-        )
+        self.config = config
 
         # hash grid params
         num_levels = 16  # L - number of levels
@@ -169,10 +172,9 @@ class NERFTinyCudaNetwork(nn.Module):
         fine_resolution = 2**19  # N_max - the finest resolution
         growth_factor = np.exp2((np.log2(fine_resolution) - np.log2(coarse_resolution)) / (num_levels - 1))  # b - per level scale
 
-        # the base network with built in positional encoding
-        self.mlp_base = tcnn.NetworkWithInputEncoding(
+        # positional encoder
+        self.position_encoder = tcnn.Encoding(
             n_input_dims=3,
-            n_output_dims=1 + config.base_output_size,
             encoding_config={
                 "otype": "HashGrid",
                 "n_levels": num_levels,
@@ -181,6 +183,23 @@ class NERFTinyCudaNetwork(nn.Module):
                 "base_resolution": coarse_resolution,
                 "per_level_scale": growth_factor,
             },
+        )
+        self.position_encoder_schedule = PositionalEncodingWeightSchedule(num_levels, encoding_size, config.position_encoding_coarse_to_fine_schedule)
+
+        # directional encoder
+        self.direction_encoder = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "SphericalHarmonics",
+                "degree": 4,
+            },
+        )
+        self.direction_encoder_schedule = PositionalEncodingWeightSchedule(4, [1, 3, 5, 7], config.position_encoding_coarse_to_fine_schedule)
+
+        # the base network with built in positional encoding
+        self.mlp_base = tcnn.Network(
+            n_input_dims=self.position_encoder.n_output_dims,
+            n_output_dims=1 + config.base_output_size,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
@@ -215,10 +234,15 @@ class NERFTinyCudaNetwork(nn.Module):
 
     def forward(self, positions, directions, is_training=False):
         positions = (positions + 1) / 2  # normalize to [0, 1]
+        positions = self.position_encoder(positions)
+        if self.config.position_encoding_coarse_to_fine_schedule is not None:
+            positions = self.position_encoder_schedule(positions, is_training=is_training)
         
         # encode the 3D viweing direction vector using a positional encoding
         directions = (directions + 1) / 2  # normalize to [0, 1]
         directions = self.direction_encoder(directions)
+        if self.config.position_encoding_coarse_to_fine_schedule is not None:
+            directions = self.direction_encoder_schedule(directions, is_training=is_training)
 
         # pass the encoded position through the base MLP to get the volume density and 256 dimensional feature vector
         x = self.mlp_base(positions)
@@ -240,3 +264,24 @@ class NERFTinyCudaNetwork(nn.Module):
 
         # return the opacity (volume density) and color (RGB radiance)
         return volume_density, rgb_radiance, semantics_logits
+
+
+
+class PositionalEncodingWeightSchedule:
+    def __init__(self, num_levels, encoding_size, schedule):
+        self.num_levels = num_levels
+        self.encoding_size = encoding_size
+        self.schedule = schedule
+        self.progress = 0
+
+    def __call__(self, positions, is_training=False):
+        start, end = self.schedule
+        alpha = (self.progress - start) / (end - start) * self.num_levels
+        k = torch.arange(self.num_levels, dtype=torch.float32)
+        weights = (1 - torch.cos((alpha - k).clamp(min=0, max=1) * torch.pi)) / 2
+        weights = weights[..., None].repeat_interleave(torch.tensor(self.encoding_size, requires_grad=False), dim=0).squeeze()
+        weights_len = weights.shape[0]
+        positions = torch.concat((positions[..., :-weights_len], positions[..., -weights_len:] * weights.to(positions)), dim=-1)
+        if is_training:
+            self.progress += 1
+        return positions

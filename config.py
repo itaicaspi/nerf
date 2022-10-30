@@ -12,6 +12,8 @@ class Config:
     num_fine_samples: int = 0  # N_f
     learning_rate: float = 1e-4
     learning_rate_decay: float = 0.99
+    pose_learning_rate: float = 1e-2
+    pose_learning_rate_decay: float = 0.99
     L_position: int = 10
     L_direction: int = None
     num_layers_base: int = 8
@@ -26,3 +28,5 @@ class Config:
     inference_batch_size: int = 4096 * 4
     num_semantic_labels: int = 0
     semantic_loss_weight: float = 1
+    train_camera_poses: bool = False
+    position_encoding_coarse_to_fine_schedule: List[float] = None

@@ -26,7 +26,9 @@ instant_ngp_config = Config(
     volume_density_regularization = 0,
     batch_size = 1024,
     inference_batch_size=4096,
-    network_class=NERFTinyCudaNetwork
+    network_class=NERFTinyCudaNetwork,
+    train_camera_poses=True,
+    position_encoding_coarse_to_fine_schedule=[0, 10000],
 )
 
 
@@ -69,7 +71,9 @@ original_config = Config(
     volume_density_regularization = 1,
     batch_size = 1024,
     inference_batch_size=4096,
-    network_class=NERFNetwork
+    network_class=NERFNetwork,
+    train_camera_poses=True,
+    position_encoding_coarse_to_fine_schedule=[0, 10000],
 )
 
 tiny_config = Config(
@@ -90,7 +94,7 @@ tiny_config = Config(
 
 # load data and setup models
 device = 'cuda'
-config = instant_ngp_config
+config = original_config
 results_dir = "results/lego_instant_ngp"
 dataset = NERFDataset('lego')
 dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=16)
@@ -120,7 +124,7 @@ for epoch in range(1, num_epochs+1):
 
         total_steps += 1
         timestamp = datetime.now() - start_time
-        lr = nerf.lr_scheduler.get_last_lr()[0]
+        lr = nerf.lr_schedulers[0].get_last_lr()[0]
         print(f'{timestamp} epoch {epoch} / step {total_steps}: lr = {lr:.5f} loss = {loss:.5f} psnr = {psnr:.5f}')
         
         if total_steps % plot_every_n_steps == 0:
@@ -130,7 +134,7 @@ for epoch in range(1, num_epochs+1):
                 plt.imshow_native(tensor_to_image(fine_result.white_rgb))
         
         if total_steps % step_lr_every_n_steps == 0:
-            nerf.lr_scheduler.step()
+            for lr_scheduler in nerf.lr_schedulers: lr_scheduler.step()
 
         if total_steps % save_checkpoint_every_n_steps == 0:
             nerf.save(results_dir, epoch, total_steps, loss)
